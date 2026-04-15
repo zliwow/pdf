@@ -7,22 +7,51 @@ from pathlib import Path
 import fitz  # pymupdf
 
 
-# Matches a ToC line like:
-#   "1 Introduction ............ 16"
-#   "3.2.1  Boot Sequence                 42"
-#   "2  Scope"
-# Groups: section_number, title, optional page_number.
+# A ToC row, visually reconstructed. The number may be alone at the start,
+# title in the middle, page number at the end. Dot leaders become spaces.
 TOC_LINE_RE = re.compile(
     r"""
     ^\s*
-    (?P<num>\d+(?:\.\d+)*)          # section number: 1, 1.2, 3.2.1
-    [\s\.]+                         # dot leaders or spaces
-    (?P<title>.+?)                  # title (non-greedy)
-    (?:[\s\.]+(?P<page>\d{1,4}))?   # optional trailing page number
+    (?P<num>\d+(?:\.\d+)*)           # section number
+    \s+
+    (?P<title>.+?)                   # title
+    \s+
+    (?P<page>\d{1,4})                # trailing page number (required here)
     \s*$
     """,
     re.VERBOSE,
 )
+
+# Fallback for rows without a page number (still useful for section map).
+TOC_LINE_NO_PAGE_RE = re.compile(
+    r"^\s*(?P<num>\d+(?:\.\d+)*)\s+(?P<title>.+?)\s*$"
+)
+
+
+def reconstruct_rows(page: fitz.Page, y_tol: float = 2.5) -> list[str]:
+    """Rebuild visual rows from word positions so 3-column ToC layouts don't
+    get flattened into separate lines for number / title / page."""
+    words = page.get_text("words")  # (x0, y0, x1, y1, text, block, line, word)
+    if not words:
+        return []
+    # Bucket by rounded y-midpoint so words on the same visual row group together.
+    rows: dict[int, list[tuple[float, str]]] = {}
+    for x0, y0, x1, y1, text, *_ in words:
+        if not text.strip():
+            continue
+        y_mid = (y0 + y1) / 2
+        key = int(round(y_mid / y_tol))
+        rows.setdefault(key, []).append((x0, text))
+    out: list[str] = []
+    for key in sorted(rows):
+        row_words = sorted(rows[key], key=lambda w: w[0])
+        # Collapse runs of dots (leaders) down to a single space.
+        joined = " ".join(w for _, w in row_words)
+        joined = re.sub(r"[\.\s]*\.{2,}[\.\s]*", " ", joined)
+        joined = re.sub(r"\s+", " ", joined).strip()
+        if joined:
+            out.append(joined)
+    return out
 
 
 def parse_toc_pages(pdf_path: Path, page_range: tuple[int, int]) -> list[dict]:
@@ -32,27 +61,32 @@ def parse_toc_pages(pdf_path: Path, page_range: tuple[int, int]) -> list[dict]:
 
     entries: list[dict] = []
     for pno in range(lo, hi + 1):
-        text = doc[pno].get_text("text")
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
+        page = doc[pno]
+        for line in reconstruct_rows(page):
             m = TOC_LINE_RE.match(line)
-            if not m:
-                continue
-            num = m.group("num")
-            title = m.group("title").strip().strip(".").strip()
-            page = m.group("page")
+            page_num: int | None = None
+            if m:
+                num = m.group("num")
+                title = m.group("title").strip().strip(".").strip()
+                page_num = int(m.group("page"))
+            else:
+                m2 = TOC_LINE_NO_PAGE_RE.match(line)
+                if not m2:
+                    continue
+                num = m2.group("num")
+                title = m2.group("title").strip().strip(".").strip()
+                # Skip garbage like "1 ." where title collapsed to nothing.
+                if not title or title.isdigit():
+                    continue
             entries.append({
                 "section_number": num,
                 "title": title,
-                "page": int(page) if page else None,
+                "page": page_num,
                 "level": num.count(".") + 1,
                 "source_toc_page": pno + 1,
             })
 
-    # De-dupe while preserving order (same section can appear multiple times
-    # if it wraps across lines; keep the entry that has a page number).
+    # De-dupe by section number; prefer the entry that has a page.
     seen: dict[str, dict] = {}
     for e in entries:
         key = e["section_number"]
