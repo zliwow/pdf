@@ -233,7 +233,9 @@ SYSTEM_PROMPT = (
     "You are a requirements traceability analyst. For each (requirement, PDF page) pair, "
     "decide whether the PDF page covers the requirement. Be strict about the text — if the "
     "page discusses the same topic but with different wording, values, or signal names, mark it "
-    "as mismatch, not covered. Reply with a single JSON object and nothing else."
+    "as mismatch, not covered.\n\n"
+    "CRITICAL: Respond with ONLY a single JSON object. No preamble, no explanation before or after. "
+    "Start your response with { and end with }. Do not wrap in code fences."
 )
 
 USER_TEMPLATE = """Requirement:
@@ -285,14 +287,24 @@ async def classify_one(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user},
             ],
-            response_format={"type": "json_object"},
             temperature=0.0,
-            max_tokens=400,
+            max_tokens=2000,  # Qwen reasoning models may spend tokens on thinking before JSON.
         )
         msg = resp.choices[0].message
-        # Reasoning models sometimes put the payload in reasoning_content instead.
-        content = msg.content or getattr(msg, "reasoning_content", None) or "{}"
-        data = parse_llm_json(content)
+        # Reasoning models sometimes put the payload in reasoning_content instead of content.
+        content = (msg.content or "").strip() or (getattr(msg, "reasoning_content", None) or "").strip()
+        if not content:
+            return Verdict(
+                req_row=req.row_index, page_index=page.index, status="error",
+                quoted_text="", reasoning="LLM returned empty response",
+            )
+        try:
+            data = parse_llm_json(content)
+        except json.JSONDecodeError:
+            return Verdict(
+                req_row=req.row_index, page_index=page.index, status="error",
+                quoted_text="", reasoning=f"JSON parse failed. Raw: {content[:500]}",
+            )
         status = str(data.get("status", "")).strip().lower()
         if status not in {"covered", "mismatch", "not_mentioned"}:
             status = "error"
@@ -376,15 +388,16 @@ STATUS_FILLS = {
 REPORT_COLUMNS = [
     ("Jama ID", 18),
     ("Name", 40),
-    ("Item Type", 22),
     ("Status", 16),
-    ("Matched Page", 14),
-    ("Matched Section", 40),
-    ("Excel Description", 60),
+    ("Excel Requirement Text", 60),
     ("PDF Quote", 60),
     ("Word Diff", 40),
+    ("Matched Page", 14),
+    ("Matched Section", 40),
+    ("Item Type", 22),
     ("Reasoning", 60),
 ]
+STATUS_COL = 3  # 1-indexed position of the Status column above (for coloring)
 
 
 def write_report(results: list[dict], out_path: Path) -> None:
@@ -402,9 +415,10 @@ def write_report(results: list[dict], out_path: Path) -> None:
     for r_idx, res in enumerate(results, start=2):
         req: Req = res["req"]
         values = [
-            req.jama_id, req.name, req.item_type,
-            res["status"], res["matched_page"], res["matched_section"],
-            req.description, res["pdf_quote"], res["diff"], res["reasoning"],
+            req.jama_id, req.name, res["status"],
+            req.description, res["pdf_quote"], res["diff"],
+            res["matched_page"], res["matched_section"], req.item_type,
+            res["reasoning"],
         ]
         for c_idx, val in enumerate(values, start=1):
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
@@ -415,7 +429,7 @@ def write_report(results: list[dict], out_path: Path) -> None:
             id_cell.hyperlink = req.hyperlink
             id_cell.font = Font(color="0563C1", underline="single")
 
-        status_cell = ws.cell(row=r_idx, column=4)
+        status_cell = ws.cell(row=r_idx, column=STATUS_COL)
         fill = STATUS_FILLS.get(res["status"])
         if fill is not None:
             status_cell.fill = fill
