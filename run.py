@@ -230,25 +230,25 @@ def top_k_indices(sim_row: np.ndarray, k: int) -> list[int]:
 # ---------- LLM ----------
 
 SYSTEM_PROMPT = (
-    "You are a requirements traceability analyst. For each (requirement, PDF page) pair, "
-    "decide whether the PDF page covers the requirement.\n\n"
+    "You are a requirements traceability analyst. For each (Jama item, PDF page) pair, "
+    "decide whether the PDF page covers the Jama item.\n\n"
     "Definitions — read carefully:\n"
-    "- covered: The PDF page addresses the same substantive content as the requirement. "
-    "Different wording, synonyms, or paraphrasing is FINE. Example: requirement says "
+    "- covered: The PDF page addresses the same substantive content as the Jama item. "
+    "Different wording, synonyms, or paraphrasing is FINE. Example: Jama says "
     "'External pull-up', PDF says 'pulled high externally' — this is COVERED, not mismatch. "
     "What matters is the technical content: same signal names, same behavior, same values.\n"
-    "- mismatch: The PDF page discusses the same topic but the actual technical content "
-    "differs — different numeric values, different signal names, different logic, or a "
-    "contradicting behavior. Only use mismatch when a reader would disagree with the PDF "
-    "based on the requirement.\n"
-    "- not_mentioned: The PDF page does not address this requirement's topic at all.\n\n"
+    "- mismatch: The PDF page discusses the same topic as the Jama item but the actual "
+    "technical content differs — different numeric values, different signal names, different "
+    "logic, or a contradicting behavior. Only use mismatch when a reader would disagree with "
+    "the PDF based on the Jama item.\n"
+    "- not_mentioned: The PDF page does not address this Jama item's topic at all.\n\n"
     "When in doubt between covered and mismatch, prefer covered. A wording difference alone "
     "is never a mismatch.\n\n"
     "CRITICAL: Respond with ONLY a single JSON object. No preamble, no explanation before or after. "
     "Start your response with { and end with }. Do not wrap in code fences."
 )
 
-USER_TEMPLATE = """Requirement:
+USER_TEMPLATE = """Jama item:
 ID: {jama_id}
 Name: {name}
 Description: {description}
@@ -260,7 +260,7 @@ PDF page {page_number} text:
 
 Return JSON with:
 - status: one of "covered", "mismatch", "not_mentioned"
-- quoted_text: exact substring of the PDF page text that matches this requirement, or "" if not_mentioned
+- quoted_text: exact substring of the PDF page text that corresponds to this Jama item, or "" if not_mentioned
 - reasoning: one sentence explaining the classification
 """
 
@@ -397,14 +397,14 @@ STATUS_FILLS = {
 
 REPORT_COLUMNS = [
     ("Jama ID", 18),
-    ("Name", 40),
+    ("Jama Name", 40),
     ("Status", 16),
-    ("Excel Requirement Text", 60),
+    ("Jama Description", 60),
     ("PDF Quote", 60),
     ("Word Diff", 40),
-    ("Matched Page", 14),
-    ("Matched Section", 40),
-    ("Item Type", 22),
+    ("PDF Page", 14),
+    ("PDF Section", 40),
+    ("Jama Item Type", 22),
     ("Reasoning", 60),
 ]
 STATUS_COL = 3  # 1-indexed position of the Status column above (for coloring)
