@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Input files — keep data out of the repo
+*.xlsx
+*.xls
+*.pdf
+
+# Extraction outputs
+excel.json
+pdf.json
+*.out.json
