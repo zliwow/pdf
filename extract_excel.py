@@ -1,9 +1,13 @@
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 import pandas as pd
+
+
+HYPERLINK_FORMULA_RE = re.compile(r'HYPERLINK\(\s*"([^"]+)"', re.IGNORECASE)
 
 
 def hyperlinks_xls(xlsx_path: Path, sheet_ref: str | int, header: int) -> dict[int, dict[str, str]]:
@@ -28,23 +32,42 @@ def hyperlinks_xls(xlsx_path: Path, sheet_ref: str | int, header: int) -> dict[i
 
 
 def hyperlinks_xlsx(xlsx_path: Path, sheet_ref: str | int, header: int) -> dict[int, dict[str, str]]:
-    """Extract hyperlinks from a .xlsx file via openpyxl, keyed by data-row index."""
+    """Extract hyperlinks from a .xlsx file.
+
+    Handles two storage forms Jama uses:
+      - true hyperlinks (cell.hyperlink.target)
+      - =HYPERLINK("url", "text") formulas (parsed from the formula string)
+    """
     from openpyxl import load_workbook  # type: ignore
 
-    wb = load_workbook(xlsx_path, read_only=False, data_only=True)
+    # data_only=False so formula strings are returned as cell.value instead of the cached result.
+    wb = load_workbook(xlsx_path, read_only=False, data_only=False)
     ws = wb[sheet_ref] if isinstance(sheet_ref, str) else wb.worksheets[sheet_ref]
 
     header_1i = header + 1
-    header_cells = list(next(ws.iter_rows(min_row=header_1i, max_row=header_1i)))
+    try:
+        header_row = next(ws.iter_rows(min_row=header_1i, max_row=header_1i))
+    except StopIteration:
+        return {}
+    header_cells = list(header_row)
     col_names = [str(c.value) if c.value is not None else f"col_{c.column}" for c in header_cells]
 
     result: dict[int, dict[str, str]] = {}
     for r_idx, row in enumerate(ws.iter_rows(min_row=header_1i + 1)):
         for cell in row:
+            url: str | None = None
             if cell.hyperlink and cell.hyperlink.target:
+                url = cell.hyperlink.target
+            else:
+                v = cell.value
+                if isinstance(v, str) and v.startswith("="):
+                    m = HYPERLINK_FORMULA_RE.search(v)
+                    if m:
+                        url = m.group(1)
+            if url:
                 ci = cell.column - 1
                 col = col_names[ci] if ci < len(col_names) else f"col_{cell.column}"
-                result.setdefault(r_idx, {})[col] = cell.hyperlink.target
+                result.setdefault(r_idx, {})[col] = url
     return result
 
 
