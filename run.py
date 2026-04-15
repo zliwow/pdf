@@ -231,9 +231,19 @@ def top_k_indices(sim_row: np.ndarray, k: int) -> list[int]:
 
 SYSTEM_PROMPT = (
     "You are a requirements traceability analyst. For each (requirement, PDF page) pair, "
-    "decide whether the PDF page covers the requirement. Be strict about the text — if the "
-    "page discusses the same topic but with different wording, values, or signal names, mark it "
-    "as mismatch, not covered.\n\n"
+    "decide whether the PDF page covers the requirement.\n\n"
+    "Definitions — read carefully:\n"
+    "- covered: The PDF page addresses the same substantive content as the requirement. "
+    "Different wording, synonyms, or paraphrasing is FINE. Example: requirement says "
+    "'External pull-up', PDF says 'pulled high externally' — this is COVERED, not mismatch. "
+    "What matters is the technical content: same signal names, same behavior, same values.\n"
+    "- mismatch: The PDF page discusses the same topic but the actual technical content "
+    "differs — different numeric values, different signal names, different logic, or a "
+    "contradicting behavior. Only use mismatch when a reader would disagree with the PDF "
+    "based on the requirement.\n"
+    "- not_mentioned: The PDF page does not address this requirement's topic at all.\n\n"
+    "When in doubt between covered and mismatch, prefer covered. A wording difference alone "
+    "is never a mismatch.\n\n"
     "CRITICAL: Respond with ONLY a single JSON object. No preamble, no explanation before or after. "
     "Start your response with { and end with }. Do not wrap in code fences."
 )
