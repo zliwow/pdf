@@ -345,16 +345,20 @@ def aggregate(req: Req, verdicts: list[Verdict], pages_by_idx: dict[int, Page], 
             "diff": "",
         }
     best = max(verdicts, key=lambda v: STATUS_PRIORITY.get(v.status, -1))
-    matched_page = pages_by_idx.get(best.page_index)
+    # Only surface matched_page / matched_section / quote when the LLM actually matched
+    # something. For not_mentioned and error, the top-K candidate is just a retrieval
+    # artifact, not a real match — showing it is misleading.
+    is_match = best.status in {"covered", "mismatch"}
+    matched_page = pages_by_idx.get(best.page_index) if is_match else None
     page_num = matched_page.page_number if matched_page else None
     section = section_for_page(page_num, toc) if page_num else ""
-    diff = word_diff(req.description, best.quoted_text) if best.status in {"covered", "mismatch"} else ""
+    diff = word_diff(req.description, best.quoted_text) if is_match else ""
     return {
         "req": req,
         "status": best.status,
         "matched_page": page_num,
         "matched_section": section,
-        "pdf_quote": best.quoted_text,
+        "pdf_quote": best.quoted_text if is_match else "",
         "reasoning": best.reasoning,
         "diff": diff,
     }
