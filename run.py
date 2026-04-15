@@ -288,7 +288,7 @@ async def classify_one(
                 {"role": "user", "content": user},
             ],
             temperature=0.0,
-            max_tokens=2000,  # Qwen reasoning models may spend tokens on thinking before JSON.
+            max_tokens=16000,  # Qwen reasoning models may spend tokens on thinking before JSON.
         )
         msg = resp.choices[0].message
         # Reasoning models sometimes put the payload in reasoning_content instead of content.
