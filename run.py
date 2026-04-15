@@ -22,6 +22,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import numpy as np
 from openai import AsyncOpenAI
 from openpyxl import Workbook
@@ -288,7 +289,9 @@ async def classify_one(
             temperature=0.0,
             max_tokens=400,
         )
-        content = resp.choices[0].message.content or "{}"
+        msg = resp.choices[0].message
+        # Reasoning models sometimes put the payload in reasoning_content instead.
+        content = msg.content or getattr(msg, "reasoning_content", None) or "{}"
         data = parse_llm_json(content)
         status = str(data.get("status", "")).strip().lower()
         if status not in {"covered", "mismatch", "not_mentioned"}:
@@ -301,7 +304,7 @@ async def classify_one(
     except Exception as e:  # noqa: BLE001
         return Verdict(
             req_row=req.row_index, page_index=page.index, status="error",
-            quoted_text="", reasoning=f"LLM call failed: {e}",
+            quoted_text="", reasoning=f"LLM call failed: {type(e).__name__}: {e}",
         )
 
 
@@ -511,7 +514,10 @@ def main() -> int:
     if done:
         print(f"resuming from checkpoint: {len(done)} pairs already classified")
 
-    client = AsyncOpenAI(base_url=args.llm_url, api_key="sk-local")
+    # trust_env=False stops httpx from picking up HTTP_PROXY / HTTPS_PROXY vars,
+    # which on corporate machines otherwise hijack localhost calls and break sglang.
+    http_client = httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(120.0))
+    client = AsyncOpenAI(base_url=args.llm_url, api_key="sk-local", http_client=http_client)
     verdicts = asyncio.run(run_llm(
         client, args.llm_model, pairs, args.concurrency,
         args.checkpoint, done, args.page_text_limit,
