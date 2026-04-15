@@ -30,16 +30,29 @@ def page_text(doc: fitz.Document, start: int, end: int) -> str:
     return "\n".join(chunks).strip()
 
 
-def extract(pdf_path: Path, out_path: Path, preview_chars: int) -> None:
+def extract(pdf_path: Path, out_path: Path, preview_chars: int,
+            start_page: int | None, end_page: int | None) -> None:
     doc = fitz.open(pdf_path)
     toc = get_toc(doc)
+
+    # Normalize page range (1-indexed input -> 0-indexed internal). Inclusive on both ends.
+    lo = (start_page - 1) if start_page else 0
+    hi = (end_page - 1) if end_page else (doc.page_count - 1)
+    lo = max(0, lo)
+    hi = min(doc.page_count - 1, hi)
 
     sections = []
     if toc:
         for e in toc:
-            text = page_text(doc, e["start_page"], e["end_page"])
+            if e["end_page"] < lo or e["start_page"] > hi:
+                continue
+            s_lo = max(e["start_page"], lo)
+            s_hi = min(e["end_page"], hi)
+            text = page_text(doc, s_lo, s_hi)
             sections.append({
                 **e,
+                "start_page": s_lo,
+                "end_page": s_hi,
                 "char_count": len(text),
                 "text": text,
                 "preview": text[:preview_chars],
@@ -48,7 +61,7 @@ def extract(pdf_path: Path, out_path: Path, preview_chars: int) -> None:
         # Fallback: no bookmarked ToC. Dump per-page so you can still eyeball it,
         # and we can parse a printed ToC in a later pass.
         print("WARNING: no embedded ToC/bookmarks found. Dumping per-page instead.", file=sys.stderr)
-        for pno in range(doc.page_count):
+        for pno in range(lo, hi + 1):
             text = doc[pno].get_text("text").strip()
             sections.append({
                 "index": pno,
@@ -64,6 +77,7 @@ def extract(pdf_path: Path, out_path: Path, preview_chars: int) -> None:
     payload = {
         "source": str(pdf_path),
         "page_count": doc.page_count,
+        "extracted_range": [lo + 1, hi + 1],  # 1-indexed, human-readable
         "has_embedded_toc": bool(toc),
         "section_count": len(sections),
         "sections": sections,
@@ -82,9 +96,13 @@ def main() -> int:
     p.add_argument("pdf", type=Path)
     p.add_argument("-o", "--out", type=Path, default=Path("pdf.json"))
     p.add_argument("--preview", type=int, default=200, help="preview chars per section (default: 200)")
+    p.add_argument("--start-page", type=int, default=None,
+                   help="1-indexed first page to include (skip cover/history/ToC). Inclusive.")
+    p.add_argument("--end-page", type=int, default=None,
+                   help="1-indexed last page to include (skip glossary/legal). Inclusive.")
     args = p.parse_args()
 
-    extract(args.pdf, args.out, args.preview)
+    extract(args.pdf, args.out, args.preview, args.start_page, args.end_page)
     return 0
 
 
