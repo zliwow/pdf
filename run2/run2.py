@@ -98,7 +98,8 @@ class Req:
     name: str
     description: str
     item_type: str
-    is_skip_type: bool    # Folder/Heading/etc — bypass LLM, write item_type into Status
+    is_skip_type: bool    # Folder/Heading/etc — bypass LLM
+    skip_status: str      # what to write into the Status cell when is_skip_type=True
     embed_text: str       # what we embed and send to LLM
 
 
@@ -128,6 +129,13 @@ class Verdict:
 
 # ---------- helpers ----------
 
+# Jama folder IDs follow the pattern <project>-FLD-<num>. We use this as a fallback
+# when the input xlsx has no Item Type column (the customer's template does not
+# carry one), so folders still get written out as `Folder` instead of going through
+# the LLM. Match is case-insensitive on the embedded `-FLD-` token.
+FOLDER_ID_PATTERN = re.compile(r"-FLD-\d", re.IGNORECASE)
+
+
 def is_skip_item_type(item_type: str) -> bool:
     t = (item_type or "").strip()
     if t in SKIP_TYPES:
@@ -135,6 +143,10 @@ def is_skip_item_type(item_type: str) -> bool:
     if VERIFICATION_SUBSTR in t.lower():
         return True
     return False
+
+
+def looks_like_folder_id(jama_id: str) -> bool:
+    return bool(FOLDER_ID_PATTERN.search(jama_id or ""))
 
 
 def find_header_col(headers: list[str], candidates: list[str]) -> int:
@@ -226,7 +238,18 @@ def load_reqs(excel_json: Path) -> tuple[list[Req], dict, list[str]]:
         name = str(row.get(name_key, "")).strip()
         desc = str(row.get(desc_key, "")).strip()
         itype = str(row.get(type_key, "")).strip()
-        skip = is_skip_item_type(itype)
+        # Two ways to qualify as skip: real Item Type, or ID-pattern fallback.
+        # When Item Type is present we use it; otherwise we infer "Folder" from
+        # IDs of the form *-FLD-<num>.
+        if is_skip_item_type(itype):
+            skip = True
+            skip_status = itype
+        elif looks_like_folder_id(jama_id):
+            skip = True
+            skip_status = "Folder"
+        else:
+            skip = False
+            skip_status = ""
         embed_text = f"[{jama_id}] {name}\n{desc}".strip()
         reqs.append(Req(
             row_index=i,
@@ -236,6 +259,7 @@ def load_reqs(excel_json: Path) -> tuple[list[Req], dict, list[str]]:
             description=desc,
             item_type=itype,
             is_skip_type=skip,
+            skip_status=skip_status,
             embed_text=embed_text,
         ))
 
@@ -282,20 +306,32 @@ def top_k_indices(sim_row: np.ndarray, k: int) -> list[int]:
 # ---------- LLM prompts ----------
 
 PRECLASS_SYSTEM = (
-    "You are reviewing Jama requirement items. For each item you receive, decide "
-    "whether it has enough TEXT content to be compared against the body text of a PDF, "
-    "or whether it is primarily a reference to a figure, diagram, table, schematic, "
-    "image, or other non-text attachment.\n\n"
-    "Examples of figure/table references (return type=\"figure_table\"):\n"
-    "- Name 'Block Diagram' with empty or stub description.\n"
-    "- Description that is essentially 'See Figure 3.', 'Refer to Table 12.', "
-    "  'Shown in the schematic below.'\n"
-    "- The substantive content lives in a diagram, not in the description text.\n\n"
-    "Examples of text reqs (return type=\"text\"):\n"
-    "- Description contains real prose describing behavior, signals, values, timing, "
-    "  conditions, etc., even if it also mentions a figure.\n\n"
-    "Output ONLY a single JSON object — no preamble, no code fences. Start with { and "
-    "end with }."
+    "You are reviewing Jama requirement items. For each item, decide whether it can "
+    "be text-compared against PDF body text, or whether its substantive content lives "
+    "in an attachment (figure, table, diagram, schematic, image) that is NOT present "
+    "in the description.\n\n"
+    "Return type=\"figure_table\" ONLY when one of these is true:\n"
+    "  1. The description is empty or near-empty AND the name refers to a visual "
+    "     artifact, e.g. 'Block Diagram', 'Timing Diagram', 'State Diagram', "
+    "     'Schematic', 'Figure 3.2', 'Table 5'.\n"
+    "  2. The description's only substantive content is an attachment reference, "
+    "     e.g. 'See Figure 3.', 'Refer to Table 12.', 'As shown in the schematic "
+    "     below.', 'See attached diagram.' — and removing that reference leaves "
+    "     nothing meaningful behind.\n\n"
+    "Otherwise return type=\"text\". In particular, return type=\"text\" for:\n"
+    "  - Short technical statements with concrete signal names, register names, or "
+    "    conditions, even when only one short sentence. Examples: 'BIST is "
+    "    performed', 'AT POR, if TEST_CFG_AT_POR=1 (00b), valid OTP configuration, "
+    "    skip BIST at POR', 'The internal oscillator shall power up within 5us'.\n"
+    "  - Brief one-liner behaviors, requirements, constraints, or section intros. "
+    "    Brevity alone is NEVER figure_table.\n"
+    "  - Items that mention a figure but ALSO contain meaningful prose — the prose "
+    "    makes them text.\n\n"
+    "When uncertain, default to type=\"text\". The cost of misclassifying a text "
+    "item as figure_table is hiding a real coverage gap; the cost of the reverse "
+    "is just one extra page-comparison call.\n\n"
+    "Output ONLY a single JSON object — no preamble, no code fences. Start with { "
+    "and end with }."
 )
 
 PRECLASS_USER = """Jama item:
@@ -375,42 +411,68 @@ def llm_content(msg) -> str:
 
 # ---------- LLM calls ----------
 
+# Reasoning models occasionally burn the entire token budget on `<think>` and
+# never emit the final JSON, so `content` comes back empty. One automatic retry
+# clears most of these without hand-holding. Combined with a roomy max_tokens
+# the empty-response error rate drops to near zero.
+LLM_RETRIES = 1
+
+
+async def _llm_call_with_retry(client: AsyncOpenAI, model: str,
+                                messages: list[dict], max_tokens: int) -> str:
+    """Run the chat completion. Returns content text, or "" if nothing usable came
+    back even after one retry. Raises only if the underlying call itself errors out
+    on every attempt."""
+    last_exc: Exception | None = None
+    for attempt in range(LLM_RETRIES + 1):
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=max_tokens,
+            )
+            content = llm_content(resp.choices[0].message)
+            if content:
+                return content
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+    if last_exc is not None:
+        raise last_exc
+    return ""
+
+
 async def preclassify_one(client: AsyncOpenAI, model: str, req: Req) -> PreVerdict:
     user = PRECLASS_USER.format(
         jama_id=req.jama_id,
         name=req.name[:1000],
         description=req.description[:4000],
     )
+    messages = [
+        {"role": "system", "content": PRECLASS_SYSTEM},
+        {"role": "user", "content": user},
+    ]
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": PRECLASS_SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=8000,
-        )
-        content = llm_content(resp.choices[0].message)
-        if not content:
-            return PreVerdict(row_index=req.row_index, is_text=True,
-                              reason="empty LLM response — defaulting to text")
-        try:
-            data = parse_llm_json(content)
-        except json.JSONDecodeError:
-            return PreVerdict(row_index=req.row_index, is_text=True,
-                              reason=f"parse failed — defaulting to text. raw={content[:200]}",
-                              raw=content[:500])
-        t = str(data.get("type", "")).strip().lower()
-        is_text = t != "figure_table"
-        return PreVerdict(
-            row_index=req.row_index,
-            is_text=is_text,
-            reason=str(data.get("reason", ""))[:500],
-        )
+        content = await _llm_call_with_retry(client, model, messages, max_tokens=12000)
     except Exception as e:  # noqa: BLE001
         return PreVerdict(row_index=req.row_index, is_text=True,
                           reason=f"LLM error — defaulting to text: {type(e).__name__}: {e}")
+    if not content:
+        return PreVerdict(row_index=req.row_index, is_text=True,
+                          reason="empty LLM response after retry — defaulting to text")
+    try:
+        data = parse_llm_json(content)
+    except json.JSONDecodeError:
+        return PreVerdict(row_index=req.row_index, is_text=True,
+                          reason=f"parse failed — defaulting to text. raw={content[:200]}",
+                          raw=content[:500])
+    t = str(data.get("type", "")).strip().lower()
+    is_text = t != "figure_table"
+    return PreVerdict(
+        row_index=req.row_index,
+        is_text=is_text,
+        reason=str(data.get("reason", ""))[:500],
+    )
 
 
 async def classify_one(client: AsyncOpenAI, model: str, req: Req,
@@ -427,51 +489,46 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
         description=req.description[:4000],
         pages_block=pages_block,
     )
-
+    messages = [
+        {"role": "system", "content": CLASSIFY_SYSTEM},
+        {"role": "user", "content": user},
+    ]
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": CLASSIFY_SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.0,
-            max_tokens=16000,
-        )
-        content = llm_content(resp.choices[0].message)
-        if not content:
-            return Verdict(row_index=req.row_index, status=ST_ERROR,
-                           matched_page=None, quoted_text="",
-                           reasoning="LLM returned empty response.")
-        try:
-            data = parse_llm_json(content)
-        except json.JSONDecodeError:
-            return Verdict(row_index=req.row_index, status=ST_ERROR,
-                           matched_page=None, quoted_text="",
-                           reasoning=f"JSON parse failed. raw={content[:500]}")
-        status = str(data.get("status", "")).strip().lower()
-        if status not in {ST_IDENTICAL, ST_MISMATCH, ST_MISSING}:
-            return Verdict(row_index=req.row_index, status=ST_ERROR,
-                           matched_page=None, quoted_text="",
-                           reasoning=f"unexpected status from LLM: {status!r}")
-        matched_raw = data.get("matched_page")
-        try:
-            matched_page = int(matched_raw) if matched_raw not in (None, "", "null") else None
-        except (TypeError, ValueError):
-            matched_page = None
-        if status == ST_MISSING:
-            matched_page = None
-        return Verdict(
-            row_index=req.row_index,
-            status=status,
-            matched_page=matched_page,
-            quoted_text=str(data.get("quoted_text", ""))[:4000],
-            reasoning=str(data.get("reasoning", ""))[:1000],
-        )
+        # 32k leaves the reasoning model plenty of room to think and still emit JSON.
+        content = await _llm_call_with_retry(client, model, messages, max_tokens=32000)
     except Exception as e:  # noqa: BLE001
         return Verdict(row_index=req.row_index, status=ST_ERROR,
                        matched_page=None, quoted_text="",
                        reasoning=f"LLM call failed: {type(e).__name__}: {e}")
+    if not content:
+        return Verdict(row_index=req.row_index, status=ST_ERROR,
+                       matched_page=None, quoted_text="",
+                       reasoning="LLM returned empty response after retry.")
+    try:
+        data = parse_llm_json(content)
+    except json.JSONDecodeError:
+        return Verdict(row_index=req.row_index, status=ST_ERROR,
+                       matched_page=None, quoted_text="",
+                       reasoning=f"JSON parse failed. raw={content[:500]}")
+    status = str(data.get("status", "")).strip().lower()
+    if status not in {ST_IDENTICAL, ST_MISMATCH, ST_MISSING}:
+        return Verdict(row_index=req.row_index, status=ST_ERROR,
+                       matched_page=None, quoted_text="",
+                       reasoning=f"unexpected status from LLM: {status!r}")
+    matched_raw = data.get("matched_page")
+    try:
+        matched_page = int(matched_raw) if matched_raw not in (None, "", "null") else None
+    except (TypeError, ValueError):
+        matched_page = None
+    if status == ST_MISSING:
+        matched_page = None
+    return Verdict(
+        row_index=req.row_index,
+        status=status,
+        matched_page=matched_page,
+        quoted_text=str(data.get("quoted_text", ""))[:4000],
+        reasoning=str(data.get("reasoning", ""))[:1000],
+    )
 
 
 # ---------- checkpoints ----------
@@ -587,9 +644,10 @@ def write_template(input_xlsx: Path, output_xlsx: Path,
     for req in reqs:
         # Skip Folder/Heading/etc.: write Item Type into Status, leave D and F blank.
         if req.is_skip_type:
-            ws.cell(row=req.sheet_row, column=status_col, value=req.item_type).fill = SKIP_TYPE_FILL
+            label = req.skip_status or "Folder"
+            ws.cell(row=req.sheet_row, column=status_col, value=label).fill = SKIP_TYPE_FILL
             ws.cell(row=req.sheet_row, column=status_col).alignment = wrap
-            counts[req.item_type] = counts.get(req.item_type, 0) + 1
+            counts[label] = counts.get(label, 0) + 1
             continue
 
         pre = pre_by_row.get(req.row_index)
