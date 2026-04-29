@@ -71,17 +71,20 @@ PDF_TEXT_COL_CANDIDATES = ["PDF Text Content", "PDF Text", "PDF Content"]
 STATUS_COL_CANDIDATES = ["Status"]
 KEY_DIFF_COL_CANDIDATES = ["Key Difference", "Key difference", "Difference", "Diff"]
 
-# Status vocabulary written into the Status column.
+# Status vocabulary written into the Status column. Customer asked for a binary
+# decision: either the PDF faithfully covers the requirement (identical) or it
+# doesn't (mismatch). The "doesn't cover" case includes both contradicting
+# content and absence-from-PDF — the writer differentiates the two via the
+# matched_page / quoted_text fields, but the Status cell only shows one of two
+# values for text reqs.
 ST_IDENTICAL = "identical"
 ST_MISMATCH = "mismatch"
-ST_MISSING = "missing"
 ST_FIGURE = "figure/table"
 ST_ERROR = "error"
 
 STATUS_FILLS = {
     ST_IDENTICAL: PatternFill("solid", fgColor="C6EFCE"),  # green
     ST_MISMATCH:  PatternFill("solid", fgColor="FFEB9C"),  # yellow
-    ST_MISSING:   PatternFill("solid", fgColor="FFC7CE"),  # red
     ST_FIGURE:    PatternFill("solid", fgColor="DCE6F1"),  # light blue
     ST_ERROR:     PatternFill("solid", fgColor="F4B084"),  # orange
 }
@@ -347,24 +350,30 @@ Return JSON:
 """
 
 CLASSIFY_SYSTEM = (
-    "You are a requirements traceability analyst. You will be given a Jama requirement "
-    "and several candidate PDF pages retrieved by similarity. Pick the single page that "
-    "best matches the requirement (or none, if none of them are about this topic), and "
-    "classify the relationship.\n\n"
-    "Status definitions — read carefully:\n"
-    "- identical: A page addresses the same substantive content as the Jama item. "
-    "Different wording, synonyms, or paraphrasing is FINE. What matters is the technical "
-    "content: same signal names, same behavior, same values. Example: Jama 'External "
-    "pull-up', PDF 'pulled high externally' — IDENTICAL.\n"
-    "- mismatch: A page discusses the same topic as the Jama item, but the actual "
-    "technical content differs — different numeric values, different signal names, "
-    "different logic, or contradicting behavior. A reader cross-checking the spec would "
-    "flag the disagreement.\n"
-    "- missing: None of the candidate pages addresses this Jama item's topic.\n\n"
-    "When in doubt between identical and mismatch, prefer identical. Wording differences "
-    "alone are never a mismatch.\n\n"
-    "Output ONLY a single JSON object — no preamble, no code fences. Start with { and "
-    "end with }."
+    "You are a requirements traceability analyst. You will be given a Jama "
+    "requirement and several candidate PDF pages retrieved by similarity. Decide "
+    "whether the PDF faithfully covers the requirement, and pick the single best "
+    "matching page if any.\n\n"
+    "Status definitions — BINARY (only two possible values):\n"
+    "- identical: One of the candidate pages addresses the same substantive content "
+    "as the Jama item. Different wording, synonyms, or paraphrasing is FINE. What "
+    "matters is the technical content: same signal names, same behavior, same "
+    "values. Example: Jama 'External pull-up', PDF 'pulled high externally' — "
+    "IDENTICAL. In this case set matched_page to that page number and quoted_text "
+    "to the exact substring from that page.\n"
+    "- mismatch: Anything else. This covers BOTH of these situations:\n"
+    "    (a) A candidate page discusses the same topic as the Jama item, but the "
+    "        actual technical content differs — different numeric values, different "
+    "        signal names, different logic, contradicting behavior. In this case "
+    "        set matched_page to that page and quoted_text to the conflicting text "
+    "        from that page.\n"
+    "    (b) NONE of the candidate pages addresses the Jama item's topic. In this "
+    "        case set matched_page to null and quoted_text to an empty string.\n\n"
+    "When in doubt between identical and mismatch case (a), prefer identical. A "
+    "wording difference alone is never a mismatch — only contradicting technical "
+    "content is.\n\n"
+    "Output ONLY a single JSON object — no preamble, no code fences. Start with { "
+    "and end with }."
 )
 
 CLASSIFY_USER = """Jama item:
@@ -377,9 +386,9 @@ Candidate PDF pages (each page text is enclosed in triple quotes):
 
 Return JSON:
 {{
-  "status": "identical" | "mismatch" | "missing",
-  "matched_page": <page number from above, or null if status is missing>,
-  "quoted_text": "<exact substring from the matched page that corresponds to the Jama item, or empty string if missing>",
+  "status": "identical" | "mismatch",
+  "matched_page": <page number from above, or null if no candidate page covers the topic>,
+  "quoted_text": "<exact substring from the matched page that corresponds to the Jama item, or empty string if no page covers the topic>",
   "reasoning": "<2-3 sentences explaining the classification>"
 }}
 """
@@ -412,34 +421,78 @@ def llm_content(msg) -> str:
 # ---------- LLM calls ----------
 
 # Reasoning models occasionally burn the entire token budget on `<think>` and
-# never emit the final JSON, so `content` comes back empty. One automatic retry
-# clears most of these without hand-holding. Combined with a roomy max_tokens
-# the empty-response error rate drops to near zero.
-LLM_RETRIES = 1
+# never emit the final JSON, so `content` comes back empty. We use a two-layer
+# strategy:
+#   Attempt 1: full reasoning enabled, generous max_tokens.
+#   Attempt 2 (only on empty content): same prompt with `/no_think` appended,
+#     which Qwen3 honors by skipping the <think> phase entirely. This guarantees
+#     a non-empty response (no reasoning to overflow), at slightly lower quality
+#     for those edge cases. Definite answer beats `error`.
+NO_THINK_TOKEN = "\n\n/no_think"
 
 
-async def _llm_call_with_retry(client: AsyncOpenAI, model: str,
-                                messages: list[dict], max_tokens: int) -> str:
-    """Run the chat completion. Returns content text, or "" if nothing usable came
-    back even after one retry. Raises only if the underlying call itself errors out
-    on every attempt."""
-    last_exc: Exception | None = None
-    for attempt in range(LLM_RETRIES + 1):
-        try:
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.0,
-                max_tokens=max_tokens,
-            )
-            content = llm_content(resp.choices[0].message)
-            if content:
-                return content
-        except Exception as e:  # noqa: BLE001
-            last_exc = e
-    if last_exc is not None:
-        raise last_exc
-    return ""
+def _disable_thinking(messages: list[dict]) -> list[dict]:
+    """Return a copy of `messages` with `/no_think` appended to the last user
+    message. Qwen3 reads this token from the user prompt and skips reasoning."""
+    out = [dict(m) for m in messages]
+    for m in reversed(out):
+        if m.get("role") == "user":
+            m["content"] = (m.get("content") or "") + NO_THINK_TOKEN
+            break
+    return out
+
+
+async def _llm_call_with_fallback(
+    client: AsyncOpenAI, model: str, messages: list[dict],
+    max_tokens: int, fallback_max_tokens: int = 4000,
+) -> tuple[str, dict]:
+    """Run the chat completion. Returns (content, diagnostics).
+
+    Two attempts:
+      1. As-given, max_tokens=max_tokens, full reasoning.
+      2. Only if attempt 1 returned empty content (not on exceptions): same prompt
+         with /no_think appended, max_tokens=fallback_max_tokens.
+
+    `diagnostics` is a dict capturing finish_reason and reasoning_content lengths
+    for whichever attempts ran — written into the verdict's reasoning field so a
+    reviewer can see why a row failed without re-running anything."""
+    diag: dict = {}
+
+    # Attempt 1
+    try:
+        resp = await client.chat.completions.create(
+            model=model, messages=messages,
+            temperature=0.0, max_tokens=max_tokens,
+        )
+        choice = resp.choices[0]
+        content = llm_content(choice.message)
+        diag["a1_finish"] = choice.finish_reason
+        diag["a1_reason_len"] = len(getattr(choice.message, "reasoning_content", "") or "")
+        if content:
+            return content, diag
+    except Exception as e:  # noqa: BLE001
+        # Underlying call failed — surface, do not try the fallback (different
+        # failure mode, retrying with /no_think likely fails the same way).
+        raise
+
+    # Attempt 2 — /no_think fallback. Only reached if attempt 1 returned empty.
+    fb_messages = _disable_thinking(messages)
+    try:
+        resp = await client.chat.completions.create(
+            model=model, messages=fb_messages,
+            temperature=0.0, max_tokens=fallback_max_tokens,
+        )
+        choice = resp.choices[0]
+        content = llm_content(choice.message)
+        diag["a2_finish"] = choice.finish_reason
+        diag["a2_reason_len"] = len(getattr(choice.message, "reasoning_content", "") or "")
+        diag["a2_no_think"] = True
+        if content:
+            return content, diag
+    except Exception as e:  # noqa: BLE001
+        diag["a2_error"] = f"{type(e).__name__}: {e}"
+
+    return "", diag
 
 
 async def preclassify_one(client: AsyncOpenAI, model: str, req: Req) -> PreVerdict:
@@ -453,13 +506,15 @@ async def preclassify_one(client: AsyncOpenAI, model: str, req: Req) -> PreVerdi
         {"role": "user", "content": user},
     ]
     try:
-        content = await _llm_call_with_retry(client, model, messages, max_tokens=12000)
+        content, diag = await _llm_call_with_fallback(
+            client, model, messages, max_tokens=12000, fallback_max_tokens=2000,
+        )
     except Exception as e:  # noqa: BLE001
         return PreVerdict(row_index=req.row_index, is_text=True,
                           reason=f"LLM error — defaulting to text: {type(e).__name__}: {e}")
     if not content:
         return PreVerdict(row_index=req.row_index, is_text=True,
-                          reason="empty LLM response after retry — defaulting to text")
+                          reason=f"empty after fallback — defaulting to text. diag={diag}")
     try:
         data = parse_llm_json(content)
     except json.JSONDecodeError:
@@ -494,8 +549,12 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
         {"role": "user", "content": user},
     ]
     try:
-        # 32k leaves the reasoning model plenty of room to think and still emit JSON.
-        content = await _llm_call_with_retry(client, model, messages, max_tokens=32000)
+        # 48k leaves the reasoning model lots of room to think; if it still hits
+        # the cap (empty content), the fallback retries with /no_think to force
+        # a direct answer without reasoning.
+        content, diag = await _llm_call_with_fallback(
+            client, model, messages, max_tokens=48000, fallback_max_tokens=4000,
+        )
     except Exception as e:  # noqa: BLE001
         return Verdict(row_index=req.row_index, status=ST_ERROR,
                        matched_page=None, quoted_text="",
@@ -503,7 +562,7 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
     if not content:
         return Verdict(row_index=req.row_index, status=ST_ERROR,
                        matched_page=None, quoted_text="",
-                       reasoning="LLM returned empty response after retry.")
+                       reasoning=f"LLM empty after /no_think fallback. diag={diag}")
     try:
         data = parse_llm_json(content)
     except json.JSONDecodeError:
@@ -511,7 +570,11 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
                        matched_page=None, quoted_text="",
                        reasoning=f"JSON parse failed. raw={content[:500]}")
     status = str(data.get("status", "")).strip().lower()
-    if status not in {ST_IDENTICAL, ST_MISMATCH, ST_MISSING}:
+    # Defensive: if the LLM (or a stale checkpoint) yields the legacy "missing"
+    # value, coerce it into "mismatch". The customer's vocabulary is binary now.
+    if status == "missing":
+        status = ST_MISMATCH
+    if status not in {ST_IDENTICAL, ST_MISMATCH}:
         return Verdict(row_index=req.row_index, status=ST_ERROR,
                        matched_page=None, quoted_text="",
                        reasoning=f"unexpected status from LLM: {status!r}")
@@ -519,8 +582,6 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
     try:
         matched_page = int(matched_raw) if matched_raw not in (None, "", "null") else None
     except (TypeError, ValueError):
-        matched_page = None
-    if status == ST_MISSING:
         matched_page = None
     return Verdict(
         row_index=req.row_index,
@@ -682,15 +743,16 @@ def write_template(input_xlsx: Path, output_xlsx: Path,
             sc.fill = fill
         sc.alignment = wrap
 
-        # Key Difference cell.
+        # Key Difference cell. For mismatch we want the word-diff (when there's a
+        # quoted PDF passage to compare against) plus the model's reasoning. When
+        # quoted_text is empty (the "absent from PDF" subtype of mismatch) the
+        # diff trivially returns "" and we just show the reasoning.
         if v.status == ST_IDENTICAL:
             diff = word_diff(req.description, v.quoted_text)
             kd = diff if diff else "(no textual differences)"
         elif v.status == ST_MISMATCH:
             diff = word_diff(req.description, v.quoted_text)
             kd = (diff + "\n\n" if diff else "") + v.reasoning
-        elif v.status == ST_MISSING:
-            kd = v.reasoning
         else:
             kd = v.reasoning
         ws.cell(row=req.sheet_row, column=keydiff_col, value=kd[:1500]).alignment = wrap
@@ -742,6 +804,17 @@ def main() -> int:
     reqs, meta, columns = load_reqs(excel_json)
     pages = load_pages(pdf_json)
     print(f"loaded {len(reqs)} rows | {len(pages)} pages | column keys: {meta}")
+
+    # Drop blank trailing rows (no Jama ID) — they otherwise go through the full
+    # pipeline with degenerate input and tend to stall the run. Excel readers
+    # often surface a few empty tail rows after the real data ends. We leave
+    # those rows untouched in the output xlsx (D/E/F stay blank).
+    pre_filter_count = len(reqs)
+    reqs = [r for r in reqs if r.jama_id]
+    dropped_no_id = pre_filter_count - len(reqs)
+    if dropped_no_id:
+        print(f"dropped {dropped_no_id} rows with no Jama ID (left blank in output)")
+
     if args.limit:
         reqs = reqs[:args.limit]
         print(f"--limit {args.limit}: processing first {len(reqs)} rows")
@@ -815,9 +888,14 @@ def main() -> int:
     cls_records = cls_done_records + [asdict(v) for v in fresh_cls]
     verdicts_by_row: dict[int, Verdict] = {}
     for d in cls_records:
+        # Coerce legacy "missing" status (from earlier runs) into "mismatch" so
+        # stale checkpoint records render correctly with the new binary scheme.
+        loaded_status = str(d.get("status", ""))
+        if loaded_status == "missing":
+            loaded_status = ST_MISMATCH
         verdicts_by_row[d["row_index"]] = Verdict(
             row_index=d["row_index"],
-            status=str(d.get("status", "")),
+            status=loaded_status,
             matched_page=d.get("matched_page"),
             quoted_text=str(d.get("quoted_text", "")),
             reasoning=str(d.get("reasoning", "")),
