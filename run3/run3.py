@@ -580,13 +580,29 @@ def write_template(input_xlsx: Path, output_xlsx: Path, sheet_name: str | None,
     else:
         ws = wb.worksheets[0]
 
-    headers: list[str] = []
+    headers_r1: list[str] = []
     for cell in next(ws.iter_rows(min_row=1, max_row=1)):
-        headers.append(str(cell.value).strip() if cell.value is not None else "")
+        headers_r1.append(str(cell.value).strip() if cell.value is not None else "")
 
-    pdf_text_idx = find_header_col(headers, PDF_TEXT_COL_CANDIDATES)
-    status_idx = find_header_col(headers, STATUS_COL_CANDIDATES)
-    keydiff_idx = find_header_col(headers, KEY_DIFF_COL_CANDIDATES)
+    # Some customer templates leave a row-1 header blank and put the column's
+    # legend text on row 2 (e.g. "difference" sits below an empty header).
+    # Use row 2 as a fallback when row 1 doesn't name a column we need.
+    headers_r2: list[str] = []
+    try:
+        for cell in next(ws.iter_rows(min_row=2, max_row=2)):
+            headers_r2.append(str(cell.value).strip() if cell.value is not None else "")
+    except StopIteration:
+        pass
+
+    def locate(candidates: list[str]) -> int:
+        idx = find_header_col(headers_r1, candidates)
+        if idx >= 0:
+            return idx
+        return find_header_col(headers_r2, candidates)
+
+    pdf_text_idx = locate(PDF_TEXT_COL_CANDIDATES)
+    status_idx = locate(STATUS_COL_CANDIDATES)
+    keydiff_idx = locate(KEY_DIFF_COL_CANDIDATES)
 
     missing = []
     if pdf_text_idx < 0:
@@ -598,7 +614,7 @@ def write_template(input_xlsx: Path, output_xlsx: Path, sheet_name: str | None,
     if missing:
         raise SystemExit(
             f"could not locate columns in input xlsx: {missing}. "
-            f"headers found: {headers}"
+            f"row 1 headers: {headers_r1} | row 2 fallback: {headers_r2}"
         )
 
     pdf_text_col = pdf_text_idx + 1
