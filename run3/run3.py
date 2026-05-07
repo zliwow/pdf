@@ -475,23 +475,50 @@ def _disable_thinking(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _looks_like_json(text: str) -> bool:
+    """Cheap pre-parse check: must start with { and contain balanced braces."""
+    s = text.strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        parse_llm_json(s)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 async def _llm_call_with_fallback(
     client: AsyncOpenAI, model: str, messages: list[dict],
     max_tokens: int, fallback_max_tokens: int = 4000,
 ) -> tuple[str, dict]:
     diag: dict = {}
 
-    # Attempt 1 — full reasoning.
-    resp = await client.chat.completions.create(
-        model=model, messages=messages,
-        temperature=0.0, max_tokens=max_tokens,
-    )
+    # Attempt 1 — full reasoning. Force JSON output so the model can't ramble
+    # in prose. If sglang rejects response_format we retry without it (some
+    # builds don't support it on reasoning calls).
+    try:
+        resp = await client.chat.completions.create(
+            model=model, messages=messages,
+            temperature=0.0, max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+    except Exception as e_rf:  # noqa: BLE001
+        diag["a1_no_response_format"] = f"{type(e_rf).__name__}: {e_rf}"
+        resp = await client.chat.completions.create(
+            model=model, messages=messages,
+            temperature=0.0, max_tokens=max_tokens,
+        )
     choice = resp.choices[0]
     content = llm_content(choice.message)
     diag["a1_finish"] = choice.finish_reason
     diag["a1_reason_len"] = len(getattr(choice.message, "reasoning_content", "") or "")
-    if content:
+    if content and _looks_like_json(content):
         return content, diag
+    # If we got non-empty content but it isn't valid JSON (model narrated in
+    # prose), record that and fall through to the /no_think fallback so the
+    # row gets a structured retry instead of erroring out as a parse failure.
+    if content:
+        diag["a1_non_json"] = content[:300]
 
     # Attempt 2 — aggressive /no_think fallback. T=0.7 with top_p=0.9 and a
     # frequency penalty pushes the sampling regime as far from attempt 1 as we
