@@ -435,16 +435,18 @@ async def _llm_call_with_fallback(
     if content:
         return content, diag
 
-    # Attempt 2 — /no_think fallback. Only reached if attempt 1 emitted empty content.
-    # We additionally force JSON output via response_format={"type": "json_object"}.
-    # Without this, the model has been observed to "stop" cleanly with both content
-    # and reasoning_content empty — JSON mode rules out that no-op exit.
+    # Attempt 2 — /no_think fallback at T=0.3 with json_object. Two changes from
+    # attempt 1: thinking is disabled and temperature is non-zero. The latter is
+    # important — at T=0 a particular prompt can land deterministically in an
+    # "empty exit" region of the model's output distribution; introducing
+    # randomness on the retry breaks that trap. json_object further constrains
+    # the model away from no-op exits.
     fb_messages = _disable_thinking(messages)
     try:
         try:
             resp = await client.chat.completions.create(
                 model=model, messages=fb_messages,
-                temperature=0.0, max_tokens=fallback_max_tokens,
+                temperature=0.3, max_tokens=fallback_max_tokens,
                 response_format={"type": "json_object"},
             )
         except Exception as e_rf:  # noqa: BLE001
@@ -453,13 +455,14 @@ async def _llm_call_with_fallback(
             diag["a2_no_response_format"] = f"{type(e_rf).__name__}: {e_rf}"
             resp = await client.chat.completions.create(
                 model=model, messages=fb_messages,
-                temperature=0.0, max_tokens=fallback_max_tokens,
+                temperature=0.3, max_tokens=fallback_max_tokens,
             )
         choice = resp.choices[0]
         content = llm_content(choice.message)
         diag["a2_finish"] = choice.finish_reason
         diag["a2_reason_len"] = len(getattr(choice.message, "reasoning_content", "") or "")
         diag["a2_no_think"] = True
+        diag["a2_temp"] = 0.3
         if content:
             return content, diag
     except Exception as e:  # noqa: BLE001
@@ -499,9 +502,23 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
                        matched_page=None, quoted_text="",
                        reasoning=f"LLM call failed: {type(e).__name__}: {e}")
     if not content:
-        return Verdict(row_index=req.row_index, status=ST_ERROR,
-                       matched_page=None, quoted_text="",
-                       reasoning=f"LLM empty after /no_think fallback. diag={diag}")
+        # Graceful default: the model couldn't produce a response after both
+        # the reasoning attempt and the /no_think+T=0.3+json_object fallback.
+        # Rather than mark the row "error" (which leaves the customer's Status
+        # column with a third value outside their binary vocabulary), default
+        # to mismatch with matched_page=null. The diag is preserved in the
+        # reasoning cell prefixed with `(auto-default)` so a reviewer can find
+        # and re-verify these rows manually.
+        return Verdict(
+            row_index=req.row_index,
+            status=ST_MISMATCH,
+            matched_page=None,
+            quoted_text="",
+            reasoning=(
+                f"(auto-default) model returned empty after /no_think fallback; "
+                f"status defaulted to mismatch — review manually. diag={diag}"
+            ),
+        )
     try:
         data = parse_llm_json(content)
     except json.JSONDecodeError:
