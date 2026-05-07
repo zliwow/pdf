@@ -94,6 +94,7 @@ class Row:
     item_type: str
     name: str
     description: str
+    hyperlink: str | None = None  # extracted from the input xlsx, applied to the ID cell
 
 
 @dataclass
@@ -140,6 +141,7 @@ def load_rows(xlsx_path: Path, sheet: str | int, work_json: Path,
     desc_key = first_key(sample, DESC_COL_CANDIDATES) or "Description"
 
     out: list[Row] = []
+    linked = 0
     for i, r in enumerate(rows):
         jama_id = str(r.get(id_key, "")).strip()
         name = str(r.get(name_key, "")).strip()
@@ -147,12 +149,22 @@ def load_rows(xlsx_path: Path, sheet: str | int, work_json: Path,
         desc = str(r.get(desc_key, "")).strip()
         if not (jama_id or name):
             continue  # blank row
+        # Hyperlinks are stored by extract_excel.py keyed by column name. Try
+        # the ID column first; fall back to the first hyperlink in the row
+        # (sometimes Jama exports put the URL on a different column).
+        links = r.get("_hyperlinks") or {}
+        hyperlink = links.get(id_key)
+        if not hyperlink and links:
+            hyperlink = next(iter(links.values()), None)
+        if hyperlink:
+            linked += 1
         out.append(Row(
             sheet_index=i, jama_id=jama_id, item_type=itype,
-            name=name, description=desc,
+            name=name, description=desc, hyperlink=hyperlink,
         ))
     print(f"  {len(out)} usable rows from sheet {sheet!r} "
-          f"(keys: id={id_key!r}, name={name_key!r}, type={type_key!r}, desc={desc_key!r})")
+          f"(keys: id={id_key!r}, name={name_key!r}, type={type_key!r}, desc={desc_key!r}; "
+          f"{linked} with hyperlinks)")
     return out
 
 
@@ -490,6 +502,7 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
                 ST_MISSING, "", "", "no New candidate above threshold",
             ]
             _write_row(ws, next_row, row_vals, wrap)
+            _apply_hyperlink(ws, next_row, 1, old.hyperlink)
             counts[ST_MISSING] = counts.get(ST_MISSING, 0) + 1
             next_row += 1
             continue
@@ -514,6 +527,8 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
             status, round(name_sim, 4), round(d_sim, 4), reasoning,
         ]
         _write_row(ws, next_row, row_vals, wrap)
+        _apply_hyperlink(ws, next_row, 1, old.hyperlink)
+        _apply_hyperlink(ws, next_row, 5, new.hyperlink)
         counts[status] = counts.get(status, 0) + 1
         next_row += 1
 
@@ -527,6 +542,7 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
             ST_UNMATCHED, "", "", "",
         ]
         _write_row(ws, next_row, row_vals, wrap)
+        _apply_hyperlink(ws, next_row, 5, new.hyperlink)
         counts[ST_UNMATCHED] = counts.get(ST_UNMATCHED, 0) + 1
         next_row += 1
 
@@ -540,6 +556,9 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
     print(f"total rows in output: {next_row - 2}")
 
 
+_HYPERLINK_FONT = Font(color="0563C1", underline="single")
+
+
 def _write_row(ws, row_num: int, values: list, wrap: Alignment) -> None:
     for c_idx, val in enumerate(values, start=1):
         cell = ws.cell(row=row_num, column=c_idx, value=val)
@@ -548,6 +567,14 @@ def _write_row(ws, row_num: int, values: list, wrap: Alignment) -> None:
     fill = STATUS_FILLS.get(status_cell.value)
     if fill is not None:
         status_cell.fill = fill
+
+
+def _apply_hyperlink(ws, row_num: int, col: int, url: str | None) -> None:
+    if not url:
+        return
+    cell = ws.cell(row=row_num, column=col)
+    cell.hyperlink = url
+    cell.font = _HYPERLINK_FONT
 
 
 # ---------- main ----------
