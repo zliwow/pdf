@@ -79,14 +79,18 @@ PDF_TEXT_COL_CANDIDATES = ["PDF text", "PDF Text", "PDF Text Content", "PDF Cont
 STATUS_COL_CANDIDATES = ["Name vs PDF Status", "Name Vs PDF Status", "Status"]
 KEY_DIFF_COL_CANDIDATES = ["difference", "Difference", "Key Difference", "Key difference", "Diff"]
 
-# Status vocabulary — binary like the second half of run2.
+# Status vocabulary — binary for text reqs (identical / mismatch); figure/table
+# rows get their own status from the pre-classifier and are not run through the
+# page-coverage check.
 ST_IDENTICAL = "identical"
 ST_MISMATCH = "mismatch"
+ST_FIGURE = "figure/table"
 ST_ERROR = "error"
 
 STATUS_FILLS = {
     ST_IDENTICAL: PatternFill("solid", fgColor="C6EFCE"),  # green
     ST_MISMATCH:  PatternFill("solid", fgColor="FFEB9C"),  # yellow
+    ST_FIGURE:    PatternFill("solid", fgColor="DCE6F1"),  # light blue
     ST_ERROR:     PatternFill("solid", fgColor="F4B084"),  # orange
 }
 SKIP_TYPE_FILL = PatternFill("solid", fgColor="D9D9D9")    # grey for Folder/Heading/etc.
@@ -114,6 +118,14 @@ class Page:
     index: int
     page_number: int      # 1-based local page number within the slice
     text: str
+
+
+@dataclass
+class PreVerdict:
+    row_index: int
+    is_text: bool         # False = figure/table-only reference (skip main classifier)
+    reason: str
+    raw: str = ""
 
 
 @dataclass
@@ -337,60 +349,53 @@ def top_k_indices(sim_row: np.ndarray, k: int) -> list[int]:
 
 # ---------- LLM prompt ----------
 
-CLASSIFY_SYSTEM = (
-    "You are a requirements traceability analyst. You will be given a Jama "
-    "requirement Name and several candidate PDF pages retrieved by similarity. "
-    "Decide whether the PDF substantively covers what the Name asserts.\n\n"
-    "IMPORTANT — read carefully: a Jama Name is a short, declarative summary "
-    "of a requirement, not just a topic label. Your job is NOT to check "
-    "whether the PDF *mentions the topic* — it is to check whether the PDF "
-    "*establishes the specific assertion the Name makes*.\n\n"
-    "Examples (illustrative — these are abstract placeholders, NOT meant to "
-    "match any actual Name you see):\n"
-    "- A Name of the form '<feature> is performed' → identical only if a PDF "
-    "  page actually establishes that <feature> is performed, not just "
-    "  mentions <feature> in passing.\n"
-    "- A topical Name like '<subsystem> Configuration' → identical only if a "
-    "  PDF page substantively discusses configuration of <subsystem>. A "
-    "  passing word match is not enough.\n"
-    "- A specific assertion Name like '<module> shall use <input> as its "
-    "  reference' → identical only if a PDF page supports that exact "
-    "  assertion.\n\n"
-    "These examples are placeholders only. Treat each Name you see strictly "
-    "on its own content; do not confuse a Name with an example in this "
-    "system prompt even if their phrasing is similar.\n\n"
-    "Note on PDF page text: the candidate pages may contain document "
-    "watermarks, headers, footers, page numbers, version IDs, author names, "
-    "or confidentiality markings (e.g. 'XYZ Confidential', 'Vendor Proprietary'). "
-    "These are document metadata, not requirement content — IGNORE them when "
-    "assessing coverage and never refuse a row because of them. Always emit "
-    "the requested JSON.\n\n"
-    "Status definitions — BINARY (only two possible values):\n"
-    "- identical: a candidate page substantively establishes/discusses what "
-    "  the Name asserts. Different wording is FINE — what matters is whether "
-    "  a reader looking up this requirement in the PDF would find supporting "
-    "  content. Set matched_page to that page and quoted_text to the exact "
-    "  substring from that page that supports the requirement.\n"
-    "- mismatch: anything else. This covers BOTH:\n"
-    "    (a) A candidate page discusses the same topic but contradicts the "
-    "        Name (different signal, opposite behavior, conflicting "
-    "        assertion). Set matched_page to that page and quoted_text to "
-    "        the conflicting text.\n"
-    "    (b) NO candidate page substantively covers what the Name asserts — "
-    "        even if a page mentions the topic in passing, even if a related "
-    "        concept appears nearby. Set matched_page=null and "
-    "        quoted_text=\"\".\n\n"
-    "When in doubt between identical and mismatch case (a), prefer "
-    "identical. A wording difference alone is never a mismatch — only "
-    "contradicting content is.\n\n"
-    "When in doubt between identical and mismatch case (b), be STRICT: a "
-    "passing topic mention is mismatch (b), not identical. The Name must be "
-    "substantively supported by the PDF text.\n\n"
-    "Output ONLY a single JSON object — no preamble, no code fences. Start "
-    "with { and end with }."
+PRECLASS_SYSTEM = (
+    "You are reviewing Jama requirement Names. Decide whether a Name is a "
+    "text-based requirement (compare against PDF body text) or whether it "
+    "primarily references a figure, diagram, table, or schematic (substance "
+    "lives in an attachment, not in text).\n\n"
+    "Return type=\"figure_table\" only when the Name explicitly references a "
+    "visual artifact, e.g. 'Block Diagram', 'Timing Diagram', 'State Diagram', "
+    "'Schematic', 'Figure 3.2', 'Table 5'. Otherwise return type=\"text\". "
+    "When uncertain, default to type=\"text\".\n\n"
+    "Output ONLY a single JSON object. Start with { and end with }."
 )
 
-CLASSIFY_USER = """Jama requirement:
+PRECLASS_USER = """Jama Name:
+ID: {jama_id}
+Item Type: {item_type}
+Name: {name}
+
+Return JSON:
+{{
+  "type": "text" or "figure_table",
+  "reason": "one short sentence"
+}}
+"""
+
+# Kept deliberately short. Earlier iterations carried elaborate "substantive
+# coverage" lectures with concrete examples — the examples started colliding
+# with real Names in the data and the model began emitting empty content for
+# the colliding rows. Less prompt, fewer ways to go wrong.
+CLASSIFY_SYSTEM = (
+    "You check whether a Jama requirement Name is covered by any of a small "
+    "set of candidate PDF pages.\n\n"
+    "Status (binary):\n"
+    "- identical: a candidate page covers what the Name asserts. Different "
+    "wording, synonyms, paraphrasing are FINE.\n"
+    "- mismatch: anything else — no candidate page covers it, OR a page "
+    "discusses the topic with conflicting content.\n\n"
+    "When choosing identical, set matched_page to the page number and "
+    "quoted_text to the exact substring of that page that matches. When "
+    "choosing mismatch with no covering page, set matched_page=null and "
+    "quoted_text=\"\".\n\n"
+    "Ignore document watermarks, headers, footers, page numbers, and "
+    "confidentiality notices in the page text — they are metadata, not "
+    "requirement content. Always emit the requested JSON.\n\n"
+    "Output ONLY a single JSON object. Start with { and end with }."
+)
+
+CLASSIFY_USER = """Jama Name:
 ID: {jama_id}
 Item Type: {item_type}
 Name: {name}
@@ -401,9 +406,9 @@ Candidate PDF pages (each page text is enclosed in triple quotes):
 Return JSON:
 {{
   "status": "identical" | "mismatch",
-  "matched_page": <page number from above, or null if no candidate page substantively covers the Name>,
-  "quoted_text": "<exact substring from the matched page that supports or contradicts the Name; empty string if no page covers it>",
-  "reasoning": "<2-3 sentences explaining the classification>"
+  "matched_page": <page number from above, or null>,
+  "quoted_text": "<exact substring from the matched page, or empty string>",
+  "reasoning": "<one short sentence>"
 }}
 """
 
@@ -526,6 +531,43 @@ async def _llm_call_with_fallback(
     return "", diag
 
 
+# ---------- pre-classifier ----------
+
+async def preclassify_one(client: AsyncOpenAI, model: str, req: Req) -> PreVerdict:
+    user = PRECLASS_USER.format(
+        jama_id=req.jama_id,
+        item_type=req.item_type or "Customer Requirement",
+        name=req.name[:1000],
+    )
+    messages = [
+        {"role": "system", "content": PRECLASS_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    try:
+        content, diag = await _llm_call_with_fallback(
+            client, model, messages, max_tokens=8000, fallback_max_tokens=2000,
+        )
+    except Exception as e:  # noqa: BLE001
+        return PreVerdict(row_index=req.row_index, is_text=True,
+                          reason=f"LLM error — defaulting to text: {type(e).__name__}: {e}")
+    if not content:
+        return PreVerdict(row_index=req.row_index, is_text=True,
+                          reason=f"empty after fallback — defaulting to text. diag={diag}")
+    try:
+        data = parse_llm_json(content)
+    except json.JSONDecodeError:
+        return PreVerdict(row_index=req.row_index, is_text=True,
+                          reason=f"parse failed — defaulting to text. raw={content[:200]}",
+                          raw=content[:500])
+    t = str(data.get("type", "")).strip().lower()
+    is_text = t != "figure_table"
+    return PreVerdict(
+        row_index=req.row_index,
+        is_text=is_text,
+        reason=str(data.get("reason", ""))[:500],
+    )
+
+
 # ---------- classify ----------
 
 async def classify_one(client: AsyncOpenAI, model: str, req: Req,
@@ -642,6 +684,27 @@ def append_jsonl(path: Path, obj: dict) -> None:
 
 # ---------- runner ----------
 
+async def run_pre(client, model, reqs_to_pre, checkpoint, done_keys, concurrency):
+    sem = asyncio.Semaphore(concurrency)
+    pbar = tqdm(total=len(reqs_to_pre),
+                initial=sum(1 for r in reqs_to_pre if r.row_index in done_keys),
+                desc="pre-classify", unit="req")
+    results: list[PreVerdict] = []
+
+    async def worker(req: Req):
+        if req.row_index in done_keys:
+            return
+        async with sem:
+            v = await preclassify_one(client, model, req)
+        append_jsonl(checkpoint, asdict(v))
+        results.append(v)
+        pbar.update(1)
+
+    await asyncio.gather(*(worker(r) for r in reqs_to_pre))
+    pbar.close()
+    return results
+
+
 async def run_classify(client, model, jobs, checkpoint, done_keys,
                        concurrency, page_text_limit):
     sem = asyncio.Semaphore(concurrency)
@@ -667,7 +730,8 @@ async def run_classify(client, model, jobs, checkpoint, done_keys,
 # ---------- writer ----------
 
 def write_template(input_xlsx: Path, output_xlsx: Path, sheet_name: str | None,
-                   reqs: list[Req], verdicts_by_row: dict[int, Verdict]) -> None:
+                   reqs: list[Req], pre_by_row: dict[int, PreVerdict],
+                   verdicts_by_row: dict[int, Verdict]) -> None:
     """Open input xlsx, fill PDF text / Status / difference per row, save as
     output_xlsx. Column A formulas (HYPERLINK) are preserved by openpyxl."""
     shutil.copyfile(input_xlsx, output_xlsx)
@@ -735,6 +799,20 @@ def write_template(input_xlsx: Path, output_xlsx: Path, sheet_name: str | None,
             counts[label] = counts.get(label, 0) + 1
             continue
 
+        # Figure/table-only rows: written by the pre-classifier, not the page
+        # classifier. PDF text cell stays blank; difference cell carries the
+        # pre-classifier's reason for context.
+        pre = pre_by_row.get(req.row_index)
+        if pre and not pre.is_text:
+            ws.cell(row=req.sheet_row, column=pdf_text_col, value="").alignment = wrap
+            sc = ws.cell(row=req.sheet_row, column=status_col, value=ST_FIGURE)
+            sc.fill = STATUS_FILLS[ST_FIGURE]
+            sc.alignment = wrap
+            ws.cell(row=req.sheet_row, column=keydiff_col,
+                    value=pre.reason).alignment = wrap
+            counts[ST_FIGURE] = counts.get(ST_FIGURE, 0) + 1
+            continue
+
         v = verdicts_by_row.get(req.row_index)
         if v is None:
             ws.cell(row=req.sheet_row, column=status_col, value="").alignment = wrap
@@ -797,6 +875,7 @@ def main() -> int:
     p.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
     p.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
     p.add_argument("--page-text-limit", type=int, default=DEFAULT_PAGE_TEXT_LIMIT)
+    p.add_argument("--pre-checkpoint", type=Path, default=Path("preclassify.jsonl"))
     p.add_argument("--cls-checkpoint", type=Path, default=Path("classify.jsonl"))
     args = p.parse_args()
 
@@ -834,7 +913,12 @@ def main() -> int:
         return 1
 
     real_reqs = [r for r in reqs if not r.is_skip_type]
-    print(f"non-skip-type rows to classify: {len(real_reqs)}")
+    print(f"non-skip-type rows: {len(real_reqs)}")
+
+    pre_ckpt_path = work_dir / args.pre_checkpoint
+    pre_done_records = load_jsonl(pre_ckpt_path)
+    pre_done_keys = {d["row_index"] for d in pre_done_records}
+    print(f"pre-classify checkpoint: {len(pre_done_records)} records")
 
     cls_ckpt_path = work_dir / args.cls_checkpoint
     cls_done_records = load_jsonl(cls_ckpt_path)
@@ -867,18 +951,45 @@ def main() -> int:
 
     if not real_reqs:
         print("no rows to classify; writing template now.")
-        write_template(args.xlsx, out_path, sheet_name_for_writer, reqs, {})
+        write_template(args.xlsx, out_path, sheet_name_for_writer, reqs, {}, {})
+        print(f"\nreport written -> {out_path}")
+        return 0
+
+    # ---- pre-classify (figure/table flag) ----
+    print(f"\n>>> pre-classifying {len(real_reqs)} non-skip rows...")
+    fresh_pre = asyncio.run(run_pre(
+        client, args.llm_model, real_reqs, pre_ckpt_path, pre_done_keys,
+        args.concurrency,
+    ))
+    pre_records = pre_done_records + [asdict(v) for v in fresh_pre]
+    pre_by_row: dict[int, PreVerdict] = {}
+    for d in pre_records:
+        pre_by_row[d["row_index"]] = PreVerdict(
+            row_index=d["row_index"],
+            is_text=bool(d.get("is_text", True)),
+            reason=str(d.get("reason", "")),
+            raw=str(d.get("raw", "") or ""),
+        )
+
+    text_reqs = [r for r in real_reqs
+                 if pre_by_row.get(r.row_index) and pre_by_row[r.row_index].is_text]
+    figure_count = len(real_reqs) - len(text_reqs)
+    print(f"text rows: {len(text_reqs)} | figure/table rows: {figure_count}")
+
+    if not text_reqs:
+        print("no text rows to classify; writing template now.")
+        write_template(args.xlsx, out_path, sheet_name_for_writer, reqs, pre_by_row, {})
         print(f"\nreport written -> {out_path}")
         return 0
 
     print(f"\n>>> embedding with {args.embed_model}...")
     embed_model = SentenceTransformer(args.embed_model, device="cpu")
-    req_vecs = embed(embed_model, [r.embed_text for r in real_reqs], "reqs")
+    req_vecs = embed(embed_model, [r.embed_text for r in text_reqs], "reqs")
     page_vecs = embed(embed_model, [p.text for p in pages], "pages")
     sim = req_vecs @ page_vecs.T
 
     jobs: list[tuple[Req, list[Page]]] = []
-    for i, req in enumerate(real_reqs):
+    for i, req in enumerate(text_reqs):
         idxs = top_k_indices(sim[i], args.top_k)
         candidates = [pages[j] for j in idxs]
         jobs.append((req, candidates))
@@ -903,7 +1014,7 @@ def main() -> int:
             reasoning=str(d.get("reasoning", "")),
         )
 
-    write_template(args.xlsx, out_path, sheet_name_for_writer, reqs, verdicts_by_row)
+    write_template(args.xlsx, out_path, sheet_name_for_writer, reqs, pre_by_row, verdicts_by_row)
     print(f"\nreport written -> {out_path}")
     return 0
 
