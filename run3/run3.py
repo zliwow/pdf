@@ -407,6 +407,27 @@ def llm_content(msg) -> str:
 # /no_think retry that forces a direct answer (Qwen3 honors this token).
 NO_THINK_TOKEN = "\n\n/no_think"
 
+# Debug-log path for rows where both LLM attempts return empty. Set from main()
+# before run_classify() is invoked. The file accumulates the exact prompts +
+# diagnostics so we can see why a given row is failing without rerunning.
+_DEBUG_LOG_PATH: Path | None = None
+
+
+def set_debug_log_path(p: Path) -> None:
+    global _DEBUG_LOG_PATH
+    _DEBUG_LOG_PATH = p
+
+
+def _write_debug(record: dict) -> None:
+    if _DEBUG_LOG_PATH is None:
+        return
+    try:
+        with _DEBUG_LOG_PATH.open("a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        # Debug logging must never break the main pipeline.
+        pass
+
 
 def _disable_thinking(messages: list[dict]) -> list[dict]:
     out = [dict(m) for m in messages]
@@ -435,18 +456,17 @@ async def _llm_call_with_fallback(
     if content:
         return content, diag
 
-    # Attempt 2 — /no_think fallback at T=0.3 with json_object. Two changes from
-    # attempt 1: thinking is disabled and temperature is non-zero. The latter is
-    # important — at T=0 a particular prompt can land deterministically in an
-    # "empty exit" region of the model's output distribution; introducing
-    # randomness on the retry breaks that trap. json_object further constrains
-    # the model away from no-op exits.
+    # Attempt 2 — aggressive /no_think fallback. T=0.7 with top_p=0.9 and a
+    # frequency penalty pushes the sampling regime as far from attempt 1 as we
+    # reasonably can without changing the prompt. json_object constrains the
+    # output space to JSON, foreclosing the no-op exit observed at T=0.
     fb_messages = _disable_thinking(messages)
     try:
         try:
             resp = await client.chat.completions.create(
                 model=model, messages=fb_messages,
-                temperature=0.3, max_tokens=fallback_max_tokens,
+                temperature=0.7, top_p=0.9, frequency_penalty=0.5,
+                max_tokens=fallback_max_tokens,
                 response_format={"type": "json_object"},
             )
         except Exception as e_rf:  # noqa: BLE001
@@ -455,14 +475,17 @@ async def _llm_call_with_fallback(
             diag["a2_no_response_format"] = f"{type(e_rf).__name__}: {e_rf}"
             resp = await client.chat.completions.create(
                 model=model, messages=fb_messages,
-                temperature=0.3, max_tokens=fallback_max_tokens,
+                temperature=0.7, top_p=0.9, frequency_penalty=0.5,
+                max_tokens=fallback_max_tokens,
             )
         choice = resp.choices[0]
         content = llm_content(choice.message)
         diag["a2_finish"] = choice.finish_reason
         diag["a2_reason_len"] = len(getattr(choice.message, "reasoning_content", "") or "")
         diag["a2_no_think"] = True
-        diag["a2_temp"] = 0.3
+        diag["a2_temp"] = 0.7
+        diag["a2_top_p"] = 0.9
+        diag["a2_freq_penalty"] = 0.5
         if content:
             return content, diag
     except Exception as e:  # noqa: BLE001
@@ -503,19 +526,32 @@ async def classify_one(client: AsyncOpenAI, model: str, req: Req,
                        reasoning=f"LLM call failed: {type(e).__name__}: {e}")
     if not content:
         # Graceful default: the model couldn't produce a response after both
-        # the reasoning attempt and the /no_think+T=0.3+json_object fallback.
-        # Rather than mark the row "error" (which leaves the customer's Status
-        # column with a third value outside their binary vocabulary), default
-        # to mismatch with matched_page=null. The diag is preserved in the
-        # reasoning cell prefixed with `(auto-default)` so a reviewer can find
-        # and re-verify these rows manually.
+        # the reasoning attempt and the aggressive /no_think+json_object
+        # fallback. Rather than mark the row "error" (which leaves the
+        # customer's Status column with a third value outside their binary
+        # vocabulary), default to mismatch with matched_page=null. The diag is
+        # preserved in the reasoning cell prefixed with `(auto-default)` so a
+        # reviewer can search/sort to find these rows manually.
+        #
+        # Also write the full prompts + diag to the debug-log file so we can
+        # offline-investigate what's making the model emit empty for these
+        # specific inputs.
+        _write_debug({
+            "row_index": req.row_index,
+            "jama_id": req.jama_id,
+            "name": req.name,
+            "item_type": req.item_type,
+            "system_prompt": CLASSIFY_SYSTEM,
+            "user_prompt": user,
+            "diag": diag,
+        })
         return Verdict(
             row_index=req.row_index,
             status=ST_MISMATCH,
             matched_page=None,
             quoted_text="",
             reasoning=(
-                f"(auto-default) model returned empty after /no_think fallback; "
+                f"(auto-default) model returned empty after fallback; "
                 f"status defaulted to mismatch — review manually. diag={diag}"
             ),
         )
@@ -772,12 +808,24 @@ def main() -> int:
     cls_done_records = load_jsonl(cls_ckpt_path)
     # Records whose status is "error" should be retried on the next run rather
     # than treated as completed work — the next attempt may benefit from prompt
-    # changes or the json_object fallback.
-    cls_done_keys = {d["row_index"] for d in cls_done_records
-                     if d.get("status") != ST_ERROR}
-    error_in_ckpt = sum(1 for d in cls_done_records if d.get("status") == ST_ERROR)
+    # changes or the json_object fallback. Same for auto-default rows: re-run
+    # them too in case the new sampling parameters get a real verdict this time.
+    def _is_done(d: dict) -> bool:
+        if d.get("status") == ST_ERROR:
+            return False
+        if str(d.get("reasoning", "")).startswith("(auto-default)"):
+            return False
+        return True
+
+    cls_done_keys = {d["row_index"] for d in cls_done_records if _is_done(d)}
+    retry_n = sum(1 for d in cls_done_records if not _is_done(d))
     print(f"classify checkpoint: {len(cls_done_records)} records "
-          f"({error_in_ckpt} error rows will be retried)")
+          f"({retry_n} error/auto-default rows will be retried)")
+
+    # Debug log: rows that hit the auto-default branch will append their full
+    # prompt + diag here, so we can offline-investigate persistent empties.
+    debug_log_path = work_dir / "debug_empty.jsonl"
+    set_debug_log_path(debug_log_path)
 
     # trust_env=False stops httpx from picking up corp HTTP_PROXY vars.
     http_client = httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(DEFAULT_LLM_TIMEOUT))
