@@ -436,12 +436,25 @@ async def _llm_call_with_fallback(
         return content, diag
 
     # Attempt 2 — /no_think fallback. Only reached if attempt 1 emitted empty content.
+    # We additionally force JSON output via response_format={"type": "json_object"}.
+    # Without this, the model has been observed to "stop" cleanly with both content
+    # and reasoning_content empty — JSON mode rules out that no-op exit.
     fb_messages = _disable_thinking(messages)
     try:
-        resp = await client.chat.completions.create(
-            model=model, messages=fb_messages,
-            temperature=0.0, max_tokens=fallback_max_tokens,
-        )
+        try:
+            resp = await client.chat.completions.create(
+                model=model, messages=fb_messages,
+                temperature=0.0, max_tokens=fallback_max_tokens,
+                response_format={"type": "json_object"},
+            )
+        except Exception as e_rf:  # noqa: BLE001
+            # Some sglang builds may reject response_format. Retry without it so the
+            # call still goes through; we lose the JSON guarantee but keep liveness.
+            diag["a2_no_response_format"] = f"{type(e_rf).__name__}: {e_rf}"
+            resp = await client.chat.completions.create(
+                model=model, messages=fb_messages,
+                temperature=0.0, max_tokens=fallback_max_tokens,
+            )
         choice = resp.choices[0]
         content = llm_content(choice.message)
         diag["a2_finish"] = choice.finish_reason
@@ -740,8 +753,14 @@ def main() -> int:
 
     cls_ckpt_path = work_dir / args.cls_checkpoint
     cls_done_records = load_jsonl(cls_ckpt_path)
-    cls_done_keys = {d["row_index"] for d in cls_done_records}
-    print(f"classify checkpoint: {len(cls_done_records)} records")
+    # Records whose status is "error" should be retried on the next run rather
+    # than treated as completed work — the next attempt may benefit from prompt
+    # changes or the json_object fallback.
+    cls_done_keys = {d["row_index"] for d in cls_done_records
+                     if d.get("status") != ST_ERROR}
+    error_in_ckpt = sum(1 for d in cls_done_records if d.get("status") == ST_ERROR)
+    print(f"classify checkpoint: {len(cls_done_records)} records "
+          f"({error_in_ckpt} error rows will be retried)")
 
     # trust_env=False stops httpx from picking up corp HTTP_PROXY vars.
     http_client = httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(DEFAULT_LLM_TIMEOUT))
