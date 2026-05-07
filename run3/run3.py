@@ -275,11 +275,36 @@ def load_reqs(excel_json: Path) -> tuple[list[Req], dict, list[str]]:
     return reqs, meta, columns
 
 
+# Watermark patterns we strip from page text before sending to the LLM. Some
+# reasoning models refuse or fall into degenerate empty-output states when
+# prompts contain confidentiality markings (we observed deterministic empty
+# returns from Qwen3.6 on rows whose retrieved pages carried 'NVIDIA
+# Confidential' watermarks). The traceability check doesn't depend on this
+# metadata, so removing the trigger word is safe.
+#
+# We only strip the inline token, not whole lines — over-aggressive line
+# removal would nuke real prose that happens to mention 'confidential' in
+# passing.
+_WATERMARK_RE = re.compile(r"\bConfidential\b", re.IGNORECASE)
+
+
+def sanitize_page_text(text: str) -> str:
+    """Strip confidentiality trigger words from page text. Conservative: only
+    removes the word 'Confidential' itself, leaving surrounding context intact."""
+    text = _WATERMARK_RE.sub("", text)
+    # Collapse runs of internal whitespace produced by the strip.
+    text = re.sub(r"[ \t]{3,}", " ", text)
+    return text.strip()
+
+
 def load_pages(pdf_json: Path) -> list[Page]:
     data = json.loads(pdf_json.read_text())
     pages: list[Page] = []
     for s in data["sections"]:
         text = (s.get("text") or "").strip()
+        if not text:
+            continue
+        text = sanitize_page_text(text)
         if not text:
             continue
         pages.append(Page(
@@ -320,19 +345,26 @@ CLASSIFY_SYSTEM = (
     "of a requirement, not just a topic label. Your job is NOT to check "
     "whether the PDF *mentions the topic* — it is to check whether the PDF "
     "*establishes the specific assertion the Name makes*.\n\n"
-    "Examples:\n"
-    "- Name 'BIST is performed' → identical only if a PDF page actually "
-    "  establishes that BIST is performed (e.g. 'A built-in self test (BIST) "
-    "  shall execute at startup'). A page that merely mentions BIST in passing "
-    "  without establishing that it is performed is NOT identical.\n"
-    "- Name 'Internal Clocks' → identical if a PDF page substantively "
-    "  discusses internal clocks (a section on internal clocking, a paragraph "
-    "  describing the internal oscillator). A passing word match is not "
-    "  enough.\n"
-    "- Name 'Clock Output and RTC Shall Use the Crystal Oscillator as Time "
-    "  Base' → identical only if the PDF supports that specific assertion: "
-    "  the clock output and RTC use the crystal oscillator as their time "
-    "  base.\n\n"
+    "Examples (illustrative — these are abstract placeholders, NOT meant to "
+    "match any actual Name you see):\n"
+    "- A Name of the form '<feature> is performed' → identical only if a PDF "
+    "  page actually establishes that <feature> is performed, not just "
+    "  mentions <feature> in passing.\n"
+    "- A topical Name like '<subsystem> Configuration' → identical only if a "
+    "  PDF page substantively discusses configuration of <subsystem>. A "
+    "  passing word match is not enough.\n"
+    "- A specific assertion Name like '<module> shall use <input> as its "
+    "  reference' → identical only if a PDF page supports that exact "
+    "  assertion.\n\n"
+    "These examples are placeholders only. Treat each Name you see strictly "
+    "on its own content; do not confuse a Name with an example in this "
+    "system prompt even if their phrasing is similar.\n\n"
+    "Note on PDF page text: the candidate pages may contain document "
+    "watermarks, headers, footers, page numbers, version IDs, author names, "
+    "or confidentiality markings (e.g. 'XYZ Confidential', 'Vendor Proprietary'). "
+    "These are document metadata, not requirement content — IGNORE them when "
+    "assessing coverage and never refuse a row because of them. Always emit "
+    "the requested JSON.\n\n"
     "Status definitions — BINARY (only two possible values):\n"
     "- identical: a candidate page substantively establishes/discusses what "
     "  the Name asserts. Different wording is FINE — what matters is whether "
