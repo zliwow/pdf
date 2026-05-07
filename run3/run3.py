@@ -392,7 +392,14 @@ CLASSIFY_SYSTEM = (
     "Ignore document watermarks, headers, footers, page numbers, and "
     "confidentiality notices in the page text — they are metadata, not "
     "requirement content. Always emit the requested JSON.\n\n"
-    "Output ONLY a single JSON object. Start with { and end with }."
+    "OUTPUT FORMAT — STRICT:\n"
+    "Your entire response must be a single JSON object and nothing else.\n"
+    "- Do NOT narrate or explain your reasoning in the response.\n"
+    "- Do NOT say 'Let me check...', 'Looking at page X...', 'The user wants...'.\n"
+    "- Do NOT wrap the JSON in markdown code fences.\n"
+    "- Your first character MUST be '{' and your last character MUST be '}'.\n"
+    "Reasoning, if needed, belongs inside the 'reasoning' field of the JSON itself, "
+    "as one short sentence."
 )
 
 CLASSIFY_USER = """Jama Name:
@@ -550,8 +557,12 @@ async def _llm_call_with_fallback(
         diag["a2_temp"] = 0.7
         diag["a2_top_p"] = 0.9
         diag["a2_freq_penalty"] = 0.5
-        if content:
+        # Validate JSON: if attempt 2 also produced prose (sglang ignored
+        # response_format / /no_think), treat as failure → auto-default.
+        if content and _looks_like_json(content):
             return content, diag
+        if content:
+            diag["a2_non_json"] = content[:300]
     except Exception as e:  # noqa: BLE001
         diag["a2_error"] = f"{type(e).__name__}: {e}"
 
