@@ -502,7 +502,7 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
                 ST_MISSING, "", "", "no New candidate above threshold",
             ]
             _write_row(ws, next_row, row_vals, wrap)
-            _apply_hyperlink(ws, next_row, 1, old.hyperlink)
+            _apply_hyperlink(ws, next_row, 1, old.hyperlink, old.jama_id)
             counts[ST_MISSING] = counts.get(ST_MISSING, 0) + 1
             next_row += 1
             continue
@@ -527,8 +527,8 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
             status, round(name_sim, 4), round(d_sim, 4), reasoning,
         ]
         _write_row(ws, next_row, row_vals, wrap)
-        _apply_hyperlink(ws, next_row, 1, old.hyperlink)
-        _apply_hyperlink(ws, next_row, 5, new.hyperlink)
+        _apply_hyperlink(ws, next_row, 1, old.hyperlink, old.jama_id)
+        _apply_hyperlink(ws, next_row, 5, new.hyperlink, new.jama_id)
         counts[status] = counts.get(status, 0) + 1
         next_row += 1
 
@@ -542,7 +542,7 @@ def write_report(out_path: Path, olds: list[Row], news: list[Row],
             ST_UNMATCHED, "", "", "",
         ]
         _write_row(ws, next_row, row_vals, wrap)
-        _apply_hyperlink(ws, next_row, 5, new.hyperlink)
+        _apply_hyperlink(ws, next_row, 5, new.hyperlink, new.jama_id)
         counts[ST_UNMATCHED] = counts.get(ST_UNMATCHED, 0) + 1
         next_row += 1
 
@@ -569,11 +569,22 @@ def _write_row(ws, row_num: int, values: list, wrap: Alignment) -> None:
         status_cell.fill = fill
 
 
-def _apply_hyperlink(ws, row_num: int, col: int, url: str | None) -> None:
+def _apply_hyperlink(ws, row_num: int, col: int, url: str | None,
+                     display: str | None = None) -> None:
+    """Make a cell into a clickable hyperlink. We write a `=HYPERLINK(...)`
+    formula rather than setting cell.hyperlink alone, because that's how the
+    customer's input xlsx stores its links — Excel renders the formula form
+    as clickable blue text out of the box, while cell.hyperlink alone is
+    sometimes ignored by Excel for styling purposes.
+    """
     if not url:
         return
     cell = ws.cell(row=row_num, column=col)
-    cell.hyperlink = url
+    if not display:
+        display = str(cell.value or "")
+    url_esc = url.replace('"', '""')
+    display_esc = display.replace('"', '""')
+    cell.value = f'=HYPERLINK("{url_esc}","{display_esc}")'
     cell.font = _HYPERLINK_FONT
 
 
