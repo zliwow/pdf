@@ -120,9 +120,30 @@ def first_key(sample: dict, candidates: list[str]) -> str | None:
     return None
 
 
+def resolve_sheet_name(xlsx_path: Path, requested: str) -> str:
+    """Find the actual sheet name matching `requested` case- and whitespace-
+    insensitively. Falls back to `requested` if no match (extract_excel will
+    raise a clear error). This lets the customer name a sheet 'old Jama' or
+    'OLD JAMA' and the script still finds it."""
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+        names = list(wb.sheetnames)
+        wb.close()
+    except Exception:  # noqa: BLE001
+        return requested
+    target = requested.strip().lower()
+    for n in names:
+        if n.strip().lower() == target:
+            return n
+    return requested
+
+
 def load_rows(xlsx_path: Path, sheet: str | int, work_json: Path,
               re_extract: bool) -> list[Row]:
     """Run extract_excel for the given sheet and load the resulting JSON into Row objects."""
+    if isinstance(sheet, str):
+        sheet = resolve_sheet_name(xlsx_path, sheet)
     if re_extract or not work_json.exists():
         print(f"extracting sheet {sheet!r} from {xlsx_path.name} -> {work_json.name} ...")
         extract_excel.extract(xlsx_path, sheet=sheet, out_path=work_json, header=0)
